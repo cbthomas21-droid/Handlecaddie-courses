@@ -1,0 +1,25 @@
+name: Build course data
+on:
+  schedule:
+    - cron: "17 5 1 * *"     # 1st of every month, 05:17 UTC
+  workflow_dispatch:           # also lets you press "Run workflow" by hand
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Build
+        run: python tools/build_courses.py
+        env:
+          REGION: US-UT
+      - name: Commit changes
+        run: |
+          git config user.name "course-builder"
+          git config user.email "course-builder@users.noreply.github.com"
+          git add docs
+          git diff --cached --quiet || (git commit -m "Update course data" && git push)
