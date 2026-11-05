@@ -68,7 +68,23 @@ def count_holes(data):
     return sum(1 for e in data.get("elements", []) if e.get("type") == "way" and e.get("tags", {}).get("golf") == "hole")
 
 
+# Rough bounding boxes (south, west, north, east). A box is much cheaper for the server than "everything inside the state
+# boundary", and it also catches courses just over the border. Add a state here, or set BBOX="s,w,n,e" in the workflow.
+BBOXES = {
+    "US-UT": "36.99,-114.06,42.01,-109.03",
+    "US-CO": "36.99,-109.06,41.01,-102.04",
+    "US-AZ": "31.33,-114.82,37.01,-109.04",
+    "US-NV": "34.99,-120.01,42.01,-114.03",
+    "US-ID": "41.99,-117.25,49.01,-111.04",
+    "US-WY": "40.99,-111.06,45.01,-104.05",
+    "US-NM": "31.33,-109.06,37.01,-103.00",
+}
+
+
 def index_query():
+    box = os.environ.get("BBOX") or BBOXES.get(REGION)
+    if box:
+        return f'[out:json][timeout:90];nwr["leisure"="golf_course"]({box});out center tags;'
     return (f'[out:json][timeout:180];area["ISO3166-2"="{REGION}"]->.s;'
             f'nwr["leisure"="golf_course"](area.s);out center tags;')
 
