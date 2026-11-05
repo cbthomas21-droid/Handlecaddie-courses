@@ -37,12 +37,30 @@ def time_left():
     return BUDGET_S - (time.time() - START)
 
 
-def overpass(query, deadline=None, timeout=None, tries=2):
+COOLDOWN_S = 600        # a server that just timed out or errored twice in a row is skipped for this long
+_bad = {}               # endpoint -> [consecutive failures, skip-until time]
+
+
+def _usable(ep):
+    return time.time() >= _bad.get(ep, [0, 0])[1]
+
+
+def _note(ep, good):
+    if good:
+        _bad[ep] = [0, 0]
+    else:
+        n = _bad.get(ep, [0, 0])[0] + 1
+        _bad[ep] = [n, time.time() + COOLDOWN_S if n >= 2 else 0]
+
+
+def overpass(query, deadline=None, timeout=None, tries=2, endpoints=None):
     """POST to the Overpass servers in turn. Gives up when [deadline] (epoch seconds) or the overall budget runs out."""
     timeout = timeout or REQ_TIMEOUT
     last = None
     for attempt in range(tries):
-        for ep in ENDPOINTS:
+        for ep in (endpoints or ENDPOINTS):
+            if not _usable(ep):
+                continue
             if time_left() <= 5:
                 raise OutOfTime("overall time budget used up")
             if deadline is not None and time.time() >= deadline:
@@ -54,13 +72,19 @@ def overpass(query, deadline=None, timeout=None, tries=2):
                     text = r.read().decode("utf-8")
                 if "runtime error" in text[-500:]:
                     raise RuntimeError("server gave up (query timed out)")
-                return json.loads(text)
+                res = json.loads(text)
+                _note(ep, True)
+                res["_server"] = ep.split("/")[2]
+                return res
             except OutOfTime:
                 raise
             except Exception as e:                       # busy, timeout, bad JSON ...
                 last = e
+                _note(ep, False)
                 print(f"      {ep.split('/')[2]}: {type(e).__name__}: {e}", flush=True)
         time.sleep(min(10 * (attempt + 1), max(0, time_left() - 5)))
+        for v in _bad.values():          # a pause is over: give every server another chance on the second round
+            v[1] = 0
     raise RuntimeError(f"all servers failed: {last}")
 
 
@@ -97,7 +121,7 @@ def holes_in_course(c):
             f'(way["golf"~"{KINDS}"](area.a);node["golf"="pin"](area.a););out geom;')
 
 
-def holes_around(c, r=2000):
+def holes_around(c, r=3000):
     la, lo = c["lat"], c["lon"]
     return (f'[out:json][timeout:60];(way["golf"~"{KINDS}"](around:{r},{la},{lo});'
             f'node["golf"="pin"](around:{r},{la},{lo}););out geom;')
@@ -128,13 +152,16 @@ def load_status(path):
         return {}
 
 
-UNMAPPED_RECHECK_DAYS = 45      # a course found NOT mapped is only re-checked this often (it costs two queries every time)
+UNMAPPED_RECHECK_DAYS = 7       # a course found NOT mapped is only re-checked this often (it costs two queries every time)
 
 
 def main():
     os.makedirs(os.path.join(OUT, "c"), exist_ok=True)
     status_path = os.path.join(OUT, "status.json")
     status = load_status(status_path)
+    if status.get("_v") != 3:                    # older runs marked busy-server mistakes as "not mapped": look at those again
+        status = {k: v for k, v in status.items() if isinstance(v, dict) and v.get("result") != "unmapped"}
+        status["_v"] = 3
     now = time.time()
     print(f"budget {BUDGET_S/60:.0f} min, {REQ_TIMEOUT:.0f} s per request, {COURSE_BUDGET_S:.0f} s per course", flush=True)
 
@@ -147,7 +174,7 @@ def main():
     def key(e): return f'{e["type"]}_{e["id"]}'
     def has_file(e): return os.path.exists(os.path.join(OUT, "c", key(e) + ".json"))
     # courses with no file yet come first, so an interrupted run still gets the most useful ones done; refreshes come last
-    todo = sorted(idx, key=lambda e: (has_file(e), status.get(key(e), {}).get("t", 0)))
+    todo = sorted(idx, key=lambda e: (has_file(e), (status.get(key(e)) or {}).get("t", 0)))
 
     ok = kept = failed = unmapped = skipped = 0
     stopped_early = False
@@ -155,6 +182,8 @@ def main():
         for n, e in enumerate(todo, 1):
             k = key(e)
             st = status.get(k, {})
+            if not isinstance(st, dict):
+                st = {}
             if st.get("result") == "unmapped" and now - st.get("t", 0) < UNMAPPED_RECHECK_DAYS * 86400 and not has_file(e):
                 skipped += 1
                 continue
@@ -166,17 +195,32 @@ def main():
             path = os.path.join(OUT, "c", k + ".json")
             deadline = time.time() + COURSE_BUDGET_S
             data, err, reached = None, None, False
-            for q in (holes_in_course(c), holes_around(c)):
+            seen = []                                           # what each look said: (query, server, holes)
+            for qi, q in enumerate((holes_in_course(c), holes_around(c))):
                 if not q:
                     continue
                 try:
                     time.sleep(PAUSE)
                     d = overpass(q, deadline=deadline)
+                    n_h = count_holes(d)
+                    seen.append(("in-course" if qi == 0 else "nearby", d.get("_server", "?"), n_h))
+                    if n_h < 3:
+                        # A busy server can answer "nothing" for a course that has holes. Ask a DIFFERENT server before believing it.
+                        others = [x for x in ENDPOINTS if x.split("/")[2] != d.get("_server")]
+                        try:
+                            d2 = overpass(q, deadline=deadline, endpoints=others, tries=1)
+                            seen.append(("in-course" if qi == 0 else "nearby", d2.get("_server", "?"), count_holes(d2)))
+                            if count_holes(d2) > n_h:
+                                d, n_h = d2, count_holes(d2)
+                        except OutOfTime:
+                            raise
+                        except Exception:
+                            seen.append(("second opinion", "none answered", -1))
                     reached = True
-                    if count_holes(d) >= 3:
+                    if n_h >= 3:
                         data = d
                         break
-                    err = f"only {count_holes(d)} holes"
+                    err = f"only {n_h} holes"
                 except OutOfTime:
                     raise
                 except Exception as ex:
@@ -195,7 +239,11 @@ def main():
             elif reached and err and "holes" in err:
                 status[k] = {"t": now, "result": "unmapped"}
                 unmapped += 1
-                print(f"[{n}/{len(todo)}] UNMAPPED {name} ({err})", flush=True)
+                confirmed = all(h >= 0 for _, _, h in seen) and sum(1 for q, _, _ in seen if q != "second opinion") >= 2
+                print(f"[{n}/{len(todo)}] UNMAPPED {name} ({err}) {'; '.join(f'{q}@{sv}={h}' for q, sv, h in seen)}"
+                      f"  check: https://www.openstreetmap.org/{k.replace('_', '/')}", flush=True)
+                if not confirmed:                                # a server did not answer the second opinion: try again next run
+                    status[k] = {"t": now - (UNMAPPED_RECHECK_DAYS - 1) * 86400, "result": "unmapped"}
             else:
                 failed += 1
                 print(f"[{n}/{len(todo)}] FAILED {name} ({err})", flush=True)
@@ -207,7 +255,7 @@ def main():
         with open(status_path, "w") as f:
             json.dump(status, f, separators=(",", ":"))
         with open(os.path.join(OUT, "index.json"), "w") as f:
-            json.dump({"generated": datetime.datetime.utcnow().isoformat() + "Z", "region": REGION, "elements": idx},
+            json.dump({"generated": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat() + "Z", "region": REGION, "elements": idx},
                       f, separators=(",", ":"))
     print(f"done: {ok} built, {kept} kept, {unmapped} not mapped, {skipped} skipped (recently found unmapped), {failed} failed"
           + (" - stopped early, will continue next run" if stopped_early else ""), flush=True)
