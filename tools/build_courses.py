@@ -17,6 +17,8 @@ ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.fr/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 UA = "HandleCaddie-courses-builder/1.0 (golf push-cart companion app)"
 KINDS = "^(hole|green|fairway|bunker|tee|water_hazard|lateral_water_hazard)$"
@@ -115,12 +117,61 @@ BBOXES = {
 }
 
 
-def index_query():
-    box = os.environ.get("BBOX") or BBOXES.get(REGION)
+def index_query(box=None):
+    box = box or os.environ.get("BBOX") or BBOXES.get(REGION)
     if box:
-        return f'[out:json][timeout:90];nwr["leisure"="golf_course"]({box});out center tags;'
+        return f'[out:json][timeout:60];nwr["leisure"="golf_course"]({box});out center tags;'
     return (f'[out:json][timeout:180];area["ISO3166-2"="{REGION}"]->.s;'
             f'nwr["leisure"="golf_course"](area.s);out center tags;')
+
+
+def fetch_index():
+    """The course list. Whole region first; if every server fails, the same box in 4 smaller tiles; if that fails too,
+    the index saved by the last good run (so the nightly refresh of course data can still go on)."""
+    try:
+        return overpass(index_query(), timeout=60, tries=3)
+    except OutOfTime:
+        raise
+    except Exception as e:
+        print(f"whole-region list failed ({e}); trying smaller tiles", flush=True)
+    box = os.environ.get("BBOX") or BBOXES.get(REGION)
+    if box:
+        s, w, n, ee = [float(x) for x in box.split(",")]
+        ms, mw = (s + n) / 2, (w + ee) / 2
+        elements, got = {}, 0
+        for ts, tn in ((s, ms), (ms, n)):
+            for tw, te in ((w, mw), (mw, ee)):
+                try:
+                    r = overpass(index_query(f"{ts},{tw},{tn},{te}"), timeout=60, tries=3)
+                    got += 1
+                    for el in r.get("elements", []):
+                        elements[(el.get("type"), el.get("id"))] = el
+                except OutOfTime:
+                    raise
+                except Exception as e:
+                    print(f"      tile failed: {e}", flush=True)
+        if got == 4:
+            return {"elements": list(elements.values())}
+        if got:
+            print(f"only {got} of 4 tiles answered; using them plus the saved list", flush=True)
+            saved = _saved_index()
+            for el in saved:
+                elements.setdefault((el.get("type"), el.get("id")), el)
+            return {"elements": list(elements.values())}
+    saved = _saved_index()
+    if saved:
+        print(f"using the saved list of {len(saved)} courses from the last good run", flush=True)
+        return {"elements": saved}
+    raise RuntimeError("no Overpass server answered and there is no saved course list")
+
+
+def _saved_index():
+    try:
+        with open(os.path.join(OUT, "index.json")) as f:
+            d = json.load(f)
+        return d.get("elements", d) if isinstance(d, dict) else d
+    except Exception:
+        return []
 
 
 def holes_in_course(c):
@@ -176,7 +227,7 @@ def main():
     print(f"budget {BUDGET_S/60:.0f} min, {REQ_TIMEOUT:.0f} s per request, {COURSE_BUDGET_S:.0f} s per course", flush=True)
 
     print("asking for the list of golf courses...", flush=True)
-    idx = trim_index(overpass(index_query(), timeout=150))
+    idx = trim_index(fetch_index())
     if not idx:
         sys.exit("no courses found - refusing to overwrite the index")
     print(f"{len(idx)} named courses in {REGION}", flush=True)
