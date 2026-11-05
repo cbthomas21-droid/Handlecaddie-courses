@@ -23,11 +23,30 @@ KINDS = "^(hole|green|fairway|bunker|tee|water_hazard|lateral_water_hazard)$"
 PAUSE = float(os.environ.get("PAUSE", "3"))     # polite gap between requests to the shared servers
 
 
-def overpass(query, timeout=240, tries=4):
-    """POST to the Overpass servers in turn; retry with growing pauses. Returns parsed JSON or raises."""
+class OutOfTime(Exception):
+    pass
+
+
+START = time.time()
+BUDGET_S = float(os.environ.get("BUDGET_MIN", "150")) * 60      # stop starting new work after this long; the next run continues
+REQ_TIMEOUT = float(os.environ.get("REQ_TIMEOUT", "75"))        # seconds to wait for ONE server
+COURSE_BUDGET_S = float(os.environ.get("COURSE_BUDGET", "180")) # most time one course may use before we move on
+
+
+def time_left():
+    return BUDGET_S - (time.time() - START)
+
+
+def overpass(query, deadline=None, timeout=None, tries=2):
+    """POST to the Overpass servers in turn. Gives up when [deadline] (epoch seconds) or the overall budget runs out."""
+    timeout = timeout or REQ_TIMEOUT
     last = None
     for attempt in range(tries):
         for ep in ENDPOINTS:
+            if time_left() <= 5:
+                raise OutOfTime("overall time budget used up")
+            if deadline is not None and time.time() >= deadline:
+                raise RuntimeError(f"gave up on this course (time limit); last error: {last}")
             try:
                 req = urllib.request.Request(ep, data=("data=" + urllib.parse.quote(query)).encode(),
                                              headers={"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded"})
@@ -36,9 +55,12 @@ def overpass(query, timeout=240, tries=4):
                 if "runtime error" in text[-500:]:
                     raise RuntimeError("server gave up (query timed out)")
                 return json.loads(text)
+            except OutOfTime:
+                raise
             except Exception as e:                       # busy, timeout, bad JSON ...
                 last = e
-        time.sleep(10 * (attempt + 1))
+                print(f"      {ep.split('/')[2]}: {type(e).__name__}: {e}", flush=True)
+        time.sleep(min(10 * (attempt + 1), max(0, time_left() - 5)))
     raise RuntimeError(f"all servers failed: {last}")
 
 
@@ -82,47 +104,97 @@ def trim_index(data):
     return out
 
 
+def load_status(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+UNMAPPED_RECHECK_DAYS = 45      # a course found NOT mapped is only re-checked this often (it costs two queries every time)
+
+
 def main():
     os.makedirs(os.path.join(OUT, "c"), exist_ok=True)
-    idx = trim_index(overpass(index_query()))
+    status_path = os.path.join(OUT, "status.json")
+    status = load_status(status_path)
+    now = time.time()
+    print(f"budget {BUDGET_S/60:.0f} min, {REQ_TIMEOUT:.0f} s per request, {COURSE_BUDGET_S:.0f} s per course", flush=True)
+
+    print("asking for the list of golf courses...", flush=True)
+    idx = trim_index(overpass(index_query(), timeout=150))
     if not idx:
         sys.exit("no courses found - refusing to overwrite the index")
-    print(f"{len(idx)} named courses in {REGION}")
-    ok = kept = failed = unmapped = 0
-    for n, e in enumerate(idx, 1):
-        c = {"type": e["type"], "id": e["id"], "lat": e["center"]["lat"], "lon": e["center"]["lon"]}
-        path = os.path.join(OUT, "c", f'{c["type"]}_{c["id"]}.json')
-        data, err = None, None
-        for q in (holes_in_course(c), holes_around(c)):
-            if not q:
+    print(f"{len(idx)} named courses in {REGION}", flush=True)
+
+    def key(e): return f'{e["type"]}_{e["id"]}'
+    def has_file(e): return os.path.exists(os.path.join(OUT, "c", key(e) + ".json"))
+    # courses with no file yet come first, so an interrupted run still gets the most useful ones done; refreshes come last
+    todo = sorted(idx, key=lambda e: (has_file(e), status.get(key(e), {}).get("t", 0)))
+
+    ok = kept = failed = unmapped = skipped = 0
+    stopped_early = False
+    try:
+        for n, e in enumerate(todo, 1):
+            k = key(e)
+            st = status.get(k, {})
+            if st.get("result") == "unmapped" and now - st.get("t", 0) < UNMAPPED_RECHECK_DAYS * 86400 and not has_file(e):
+                skipped += 1
                 continue
-            try:
-                time.sleep(PAUSE)
-                d = overpass(q)
-                if count_holes(d) >= 3:
-                    data = d
-                    break
-                err = f"only {count_holes(d)} holes"
-            except Exception as ex:
-                err = str(ex)
-        name = e["tags"]["name"]
-        if data:
-            with open(path, "w") as f:
-                json.dump(data, f, separators=(",", ":"))
-            ok += 1
-            print(f"[{n}/{len(idx)}] OK    {name} ({count_holes(data)} holes)")
-        elif os.path.exists(path):
-            kept += 1
-            print(f"[{n}/{len(idx)}] KEPT  {name} (old file; {err})")
-        else:
-            unmapped += 1 if err and "holes" in err else 0
-            failed += 0 if err and "holes" in err else 1
-            print(f"[{n}/{len(idx)}] SKIP  {name} ({err})")
-    # the index goes out last, so a crash mid-run never publishes a half-built set
-    with open(os.path.join(OUT, "index.json"), "w") as f:
-        json.dump({"generated": datetime.datetime.utcnow().isoformat() + "Z", "region": REGION, "elements": idx},
-                  f, separators=(",", ":"))
-    print(f"done: {ok} built, {kept} kept, {unmapped} not mapped, {failed} failed")
+            if time_left() < 60:
+                stopped_early = True
+                print(f"time budget used up after {n-1} of {len(todo)} courses; the next run will continue", flush=True)
+                break
+            c = {"type": e["type"], "id": e["id"], "lat": e["center"]["lat"], "lon": e["center"]["lon"]}
+            path = os.path.join(OUT, "c", k + ".json")
+            deadline = time.time() + COURSE_BUDGET_S
+            data, err, reached = None, None, False
+            for q in (holes_in_course(c), holes_around(c)):
+                if not q:
+                    continue
+                try:
+                    time.sleep(PAUSE)
+                    d = overpass(q, deadline=deadline)
+                    reached = True
+                    if count_holes(d) >= 3:
+                        data = d
+                        break
+                    err = f"only {count_holes(d)} holes"
+                except OutOfTime:
+                    raise
+                except Exception as ex:
+                    err = str(ex)
+            name = e["tags"]["name"]
+            if data:
+                with open(path, "w") as f:
+                    json.dump(data, f, separators=(",", ":"))
+                status[k] = {"t": now, "result": "ok"}
+                ok += 1
+                print(f"[{n}/{len(todo)}] OK     {name} ({count_holes(data)} holes)", flush=True)
+            elif os.path.exists(path):
+                status[k] = {"t": now, "result": "kept"}
+                kept += 1
+                print(f"[{n}/{len(todo)}] KEPT   {name} (old file; {err})", flush=True)
+            elif reached and err and "holes" in err:
+                status[k] = {"t": now, "result": "unmapped"}
+                unmapped += 1
+                print(f"[{n}/{len(todo)}] UNMAPPED {name} ({err})", flush=True)
+            else:
+                failed += 1
+                print(f"[{n}/{len(todo)}] FAILED {name} ({err})", flush=True)
+    except OutOfTime:
+        stopped_early = True
+        print("time budget used up; keeping what was built so far", flush=True)
+    finally:
+        # always leave consistent files behind (even on a stop), so the workflow can still publish what was built
+        with open(status_path, "w") as f:
+            json.dump(status, f, separators=(",", ":"))
+        with open(os.path.join(OUT, "index.json"), "w") as f:
+            json.dump({"generated": datetime.datetime.utcnow().isoformat() + "Z", "region": REGION, "elements": idx},
+                      f, separators=(",", ":"))
+    print(f"done: {ok} built, {kept} kept, {unmapped} not mapped, {skipped} skipped (recently found unmapped), {failed} failed"
+          + (" - stopped early, will continue next run" if stopped_early else ""), flush=True)
 
 
 if __name__ == "__main__":
