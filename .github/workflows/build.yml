@@ -8,16 +8,18 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 200
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - name: Build
-        run: python tools/build_courses.py
+        run: python -u tools/build_courses.py
         env:
           REGION: US-UT
+          BUDGET_MIN: "150"        # the script stops by itself well before the 200-minute job limit
       - name: Commit changes
+        if: always()            # publish whatever was built, even if the build step was stopped
         run: |
           git config user.name "course-builder"
           git config user.email "course-builder@users.noreply.github.com"
