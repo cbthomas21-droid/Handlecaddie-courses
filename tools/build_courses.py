@@ -30,7 +30,7 @@ class OutOfTime(Exception):
 START = time.time()
 BUDGET_S = float(os.environ.get("BUDGET_MIN", "150")) * 60      # stop starting new work after this long; the next run continues
 REQ_TIMEOUT = float(os.environ.get("REQ_TIMEOUT", "75"))        # seconds to wait for ONE server
-COURSE_BUDGET_S = float(os.environ.get("COURSE_BUDGET", "180")) # most time one course may use before we move on
+COURSE_BUDGET_S = float(os.environ.get("COURSE_BUDGET", "120")) # most time one course may use before we move on
 
 
 def time_left():
@@ -86,6 +86,16 @@ def overpass(query, deadline=None, timeout=None, tries=2, endpoints=None):
         for v in _bad.values():          # a pause is over: give every server another chance on the second round
             v[1] = 0
     raise RuntimeError(f"all servers failed: {last}")
+
+
+def kinds_in(data):
+    """What kinds of golf features a result holds, e.g. {'green': 18, 'bunker': 40} (holes excluded)."""
+    k = {}
+    for e in data.get("elements", []):
+        g = (e.get("tags") or {}).get("golf")
+        if g and g != "hole" and e.get("type") == "way":
+            k[g] = k.get(g, 0) + 1
+    return k
 
 
 def count_holes(data):
@@ -196,6 +206,7 @@ def main():
             deadline = time.time() + COURSE_BUDGET_S
             data, err, reached = None, None, False
             seen = []                                           # what each look said: (query, server, holes)
+            mapped_kinds = {}                                   # the richest set of other features seen (greens, bunkers ...)
             for qi, q in enumerate((holes_in_course(c), holes_around(c))):
                 if not q:
                     continue
@@ -203,6 +214,9 @@ def main():
                     time.sleep(PAUSE)
                     d = overpass(q, deadline=deadline)
                     n_h = count_holes(d)
+                    kd = kinds_in(d)
+                    if sum(kd.values()) > sum(mapped_kinds.values()):
+                        mapped_kinds = kd
                     seen.append(("in-course" if qi == 0 else "nearby", d.get("_server", "?"), n_h))
                     if n_h < 3:
                         # A busy server can answer "nothing" for a course that has holes. Ask a DIFFERENT server before believing it.
@@ -242,10 +256,13 @@ def main():
                 confirmed = all(h >= 0 for _, _, h in seen) and sum(1 for q, _, _ in seen if q != "second opinion") >= 2
                 print(f"[{n}/{len(todo)}] UNMAPPED {name} ({err}) {'; '.join(f'{q}@{sv}={h}' for q, sv, h in seen)}"
                       f"  check: https://www.openstreetmap.org/{k.replace('_', '/')}", flush=True)
+                if mapped_kinds:
+                    print("            has no hole lines, but is mapped with: " + ", ".join(f"{v} {n}" for n, v in sorted(mapped_kinds.items())), flush=True)
                 if not confirmed:                                # a server did not answer the second opinion: try again next run
                     status[k] = {"t": now - (UNMAPPED_RECHECK_DAYS - 1) * 86400, "result": "unmapped"}
             else:
                 failed += 1
+                status[k] = {"t": now, "result": "failed"}      # remembered, so next run tries courses never attempted before these
                 print(f"[{n}/{len(todo)}] FAILED {name} ({err})", flush=True)
     except OutOfTime:
         stopped_early = True
